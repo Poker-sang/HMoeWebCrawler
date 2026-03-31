@@ -1,0 +1,17 @@
+namespace HMoeWebCrawler.LocalModels;
+
+public record Settings
+{
+    /// <summary>
+    /// 是否为新会话
+    /// <see langword="true"/>时，将读到的NewPostsCount清零，并从头开始计数新项目
+    /// <see langword="false"/>时，继续在已有NewPostsCount基础上计数新项目
+    /// </summary>
+    public required bool NewSession { get; init; }
+
+    public required string Email { get; init; }
+
+    public required string Password { get; init; }
+
+    public string? Cookies { get; set; }
+}
