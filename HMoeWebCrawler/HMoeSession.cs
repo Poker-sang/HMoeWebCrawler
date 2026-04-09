@@ -2,11 +2,14 @@ using System;
 using System.Collections.Generic;
 using System.IO;
 using System.Linq;
+using System.Net;
+using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
 using HMoeWebCrawler.Models;
 using Microsoft.Playwright;
+using Cookie = System.Net.Cookie;
 
 namespace HMoeWebCrawler;
 
@@ -30,8 +33,21 @@ public class HMoeSession : IAsyncDisposable
     private IBrowserContext? _browserContext;
     private IPage? _page;
     private readonly SemaphoreSlim _downloadSemaphore = new(4);
+    private readonly HttpClient _httpClient;
+    private readonly CookieContainer _cookieContainer = new();
     private string? _loginNonce;
     private DateTime _lastRequest = DateTime.MinValue;
+
+    public HMoeSession()
+    {
+        _httpClient = new HttpClient(new HttpClientHandler
+        {
+            AutomaticDecompression = DecompressionMethods.All,
+            CookieContainer = _cookieContainer
+        });
+        _httpClient.DefaultRequestHeaders.UserAgent.ParseAdd(
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0");
+    }
 
     public IReadOnlyList<Task> ImageDownloadTasks => _imageDownloadTasks;
 
@@ -98,6 +114,7 @@ public class HMoeSession : IAsyncDisposable
         }
 
         Console.WriteLine($"\e[32m网站已打开: {_page.Url}\e[0m");
+        await SyncCookiesToHttpClientAsync();
     }
 
     public async Task EnsureLoggedInAsync(string email, string password)
@@ -125,20 +142,23 @@ public class HMoeSession : IAsyncDisposable
         var base64 = captchaData.ImgData;
 
         // 在浏览器中显示验证码
-        await _page!.EvaluateAsync(@"(imgSrc) => {
-            const div = document.createElement('div');
-            div.id = 'captcha-overlay';
-            div.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:99999;display:flex;align-items:center;justify-content:center;flex-direction:column;';
-            const img = document.createElement('img');
-            img.src = imgSrc;
-            img.style.cssText = 'max-width:400px;background:white;padding:10px;border-radius:8px;';
-            div.appendChild(img);
-            const text = document.createElement('p');
-            text.textContent = '请在控制台输入验证码';
-            text.style.cssText = 'color:white;font-size:20px;margin-top:20px;';
-            div.appendChild(text);
-            document.body.appendChild(div);
-        }", base64);
+        await _page!.EvaluateAsync(
+            """
+            (imgSrc) => {
+                const div = document.createElement('div');
+                div.id = 'captcha-overlay';
+                div.style.cssText = 'position:fixed;top:0;left:0;width:100%;height:100%;background:rgba(0,0,0,0.8);z-index:99999;display:flex;align-items:center;justify-content:center;flex-direction:column;';
+                const img = document.createElement('img');
+                img.src = imgSrc;
+                img.style.cssText = 'max-width:400px;background:white;padding:10px;border-radius:8px;';
+                div.appendChild(img);
+                const text = document.createElement('p');
+                text.textContent = '请在控制台输入验证码';
+                text.style.cssText = 'color:white;font-size:20px;margin-top:20px;';
+                div.appendChild(text);
+                document.body.appendChild(div);
+            }
+            """, base64);
 
         string? captcha;
         do
@@ -150,7 +170,8 @@ public class HMoeSession : IAsyncDisposable
         await _page.EvaluateAsync("() => document.getElementById('captcha-overlay')?.remove()");
 
         // 提交登录（使用参数化调用防止注入）
-        var loginJson = await _page.EvaluateAsync<string>(@"
+        var loginJson = await _page.EvaluateAsync<string>(
+            """
             async ([nonce, email, pwd, captcha]) => {
                 const url = `/wp-admin/admin-ajax.php?_nonce=${nonce}&action=0ac2206cd584f32fba03df08b4123264&type=login`;
                 const formData = new URLSearchParams();
@@ -165,11 +186,12 @@ public class HMoeSession : IAsyncDisposable
                 });
                 return await response.text();
             }
-        ", new object[] { nonce, email, password, captcha });
+            """, new object[] { nonce, email, password, captcha });
 
         Console.WriteLine("登录响应: " + loginJson);
 
         await _page.ReloadAsync(new() { WaitUntil = WaitUntilState.NetworkIdle });
+        await SyncCookiesToHttpClientAsync();
         Console.WriteLine("\e[32m登录完成\e[0m");
     }
 
@@ -257,12 +279,13 @@ public class HMoeSession : IAsyncDisposable
     /// </summary>
     private async Task<string> PageFetchAsync(string relativeUrl)
     {
-        return await _page!.EvaluateAsync<string>(@"
+        return await _page!.EvaluateAsync<string>(
+            """
             async (url) => {
                 const response = await fetch(url, { headers: { 'X-Requested-With': 'XMLHttpRequest' } });
                 return await response.text();
             }
-        ", relativeUrl);
+            """, relativeUrl);
     }
 
     public Task WhenAllDownloadAsync() => Task.WhenAll(_imageDownloadTasks);
@@ -292,29 +315,21 @@ public class HMoeSession : IAsyncDisposable
         await _downloadSemaphore.WaitAsync();
         try
         {
-            // 在浏览器页面内通过 fetch 下载，自动带上 Referer/Cookie 等所有头，避免 CDN 防盗链 403
-            var base64 = await _page!.EvaluateAsync<string?>(@"async (url) => {
-                try {
-                    const resp = await fetch(url, { referrer: 'https://www.mhh1.com/', credentials: 'include' });
-                    if (!resp.ok) return null;
-                    const buf = await resp.arrayBuffer();
-                    const bytes = new Uint8Array(buf);
-                    let binary = '';
-                    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
-                    return btoa(binary);
-                } catch { return null; }
-            }", postThumbnailUrl.AbsoluteUri);
-
-            if (base64 is not null)
+            // 优先使用 HttpClient 直接下载（更快更稳定）
+            if (await TryDownloadWithHttpClientAsync(postThumbnailUrl, imgPath))
             {
-                var body = Convert.FromBase64String(base64);
-                await File.WriteAllBytesAsync(imgPath, body);
                 Console.WriteLine("Downloaded thumbnail " + fileName);
+                return;
             }
-            else
+
+            // 回退到浏览器内 fetch 下载，自动带上完整的浏览器环境
+            if (await TryDownloadWithBrowserAsync(postThumbnailUrl, imgPath))
             {
-                Console.WriteLine($"Download thumbnail failed [{post.Id}]: {postThumbnailUrl}");
+                Console.WriteLine("Downloaded thumbnail (browser fallback) " + fileName);
+                return;
             }
+
+            Console.WriteLine($"Download thumbnail failed [{post.Id}]: {postThumbnailUrl}");
         }
         catch (Exception e)
         {
@@ -329,11 +344,78 @@ public class HMoeSession : IAsyncDisposable
         }
     }
 
+    private async Task<bool> TryDownloadWithHttpClientAsync(Uri url, string imgPath)
+    {
+        try
+        {
+            using var request = new HttpRequestMessage(HttpMethod.Get, url);
+            request.Headers.Referrer = new Uri(Domain);
+            using var response = await _httpClient.SendAsync(request, HttpCompletionOption.ResponseHeadersRead);
+            if (!response.IsSuccessStatusCode)
+                return false;
+
+            await using var stream = await response.Content.ReadAsStreamAsync();
+            await using var fileStream = File.OpenAsyncWrite(imgPath, FileMode.Create);
+            await stream.CopyToAsync(fileStream);
+            return true;
+        }
+        catch
+        {
+            if (File.Exists(imgPath))
+                File.Delete(imgPath);
+            return false;
+        }
+    }
+
+    private async Task<bool> TryDownloadWithBrowserAsync(Uri url, string imgPath)
+    {
+        try
+        {
+            var base64 = await _page!.EvaluateAsync<string?>(
+                """
+                async (url) => {
+                    try {
+                        const resp = await fetch(url, { referrer: 'https://www.mhh1.com/', credentials: 'include' });
+                        if (!resp.ok) return null;
+                        const buf = await resp.arrayBuffer();
+                        const bytes = new Uint8Array(buf);
+                        let binary = '';
+                        for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+                        return btoa(binary);
+                    } catch { return null; }
+                }
+                """, url.AbsoluteUri);
+
+            if (string.IsNullOrEmpty(base64))
+                return false;
+
+            var body = Convert.FromBase64String(base64);
+            await File.WriteAllBytesAsync(imgPath, body);
+            return true;
+        }
+        catch
+        {
+            if (File.Exists(imgPath))
+                File.Delete(imgPath);
+            return false;
+        }
+    }
+
     private static void WriteException(Exception e) => Console.WriteLine($"\e[90m{e.Message}\e[0m");
+
+    private async Task SyncCookiesToHttpClientAsync()
+    {
+        var cookies = await _browserContext!.CookiesAsync([Domain]);
+        foreach (var c in cookies)
+        {
+            _cookieContainer.Add(new Uri(Domain), new Cookie(c.Name, c.Value, c.Path, c.Domain));
+        }
+    }
 
     public async ValueTask DisposeAsync()
     {
         GC.SuppressFinalize(this);
+        _httpClient.Dispose();
         _downloadSemaphore.Dispose();
         if (_browserContext is not null)
             await _browserContext.CloseAsync();

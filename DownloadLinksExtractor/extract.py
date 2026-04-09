@@ -2,16 +2,15 @@
 DownloadLinksExtractor - 从 DownloadSelected.json 中的文章页面提取下载链接、密码和二维码
 
 使用 Playwright + OpenCV 实现：
-1. 打开文章详情页（不等待完整加载，只等内容区出现）
-2. 点击"下载"按钮展开隐藏内容
-3. 提取下载链接、提取码、解压密码
-4. 下载图片并尝试扫描二维码，解码出网盘地址
+1. 打开文章详情页（不等待完整加载，只等工具栏出现）
+2. 点击工具栏"下载"按钮打开下载页
+3. 从下载页提取下载链接、提取码、解压密码
+4. 扫描下载页中的二维码图片，解码出网盘地址
 """
 
 import asyncio
 import json
 import os
-import re
 import sys
 
 import cv2
@@ -25,8 +24,12 @@ USER_AGENT = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/143.0.0.0 Safari/537.36 Edg/143.0.0.0"
 )
-# 内容区选择器（按优先级）
-CONTENT_SELECTORS = ".entry-content, .post-content, article .content, .article-content"
+# 下载按钮选择器（文章底部工具栏：赞/下载/收藏）
+DOWNLOAD_BTN_SELECTOR = (
+    ".inn-singular__post__toolbar__item__link:has(.fa-cloud-download-alt)"
+)
+# 下载页内容区选择器
+DOWNLOAD_PAGE_CONTENT_SELECTOR = "#inn-download-page__content"
 
 
 def scan_qr(image_bytes: bytes) -> str | None:
@@ -68,7 +71,7 @@ async def wait_for_challenge(page):
 
 
 async def extract_from_page(page, context, url: str) -> dict:
-    """导航到文章页面并提取下载信息。"""
+    """导航到文章页面，点击下载按钮打开下载页，提取下载信息。"""
     result = {
         "url": url,
         "title": "",
@@ -80,135 +83,181 @@ async def extract_from_page(page, context, url: str) -> dict:
         "errors": [],
     }
 
+    download_page = None
     try:
-        # 只等 commit（HTML 收到即可），不等所有子资源
+        # 导航到文章页面（只等 HTML 收到，不等图片等子资源）
         await page.goto(url, wait_until="commit", timeout=30000)
 
-        # 等待内容区出现（这是关键——不等 networkidle）
-        content_el = None
+        # 等待工具栏的下载按钮出现（赞/下载/收藏中的"下载"）
+        download_btn = None
         try:
-            content_el = await page.wait_for_selector(
-                CONTENT_SELECTORS, timeout=15000
+            download_btn = await page.wait_for_selector(
+                DOWNLOAD_BTN_SELECTOR, timeout=15000
             )
         except Exception:
-            # 可能是挑战页
             await wait_for_challenge(page)
             try:
-                content_el = await page.wait_for_selector(
-                    CONTENT_SELECTORS, timeout=15000
+                download_btn = await page.wait_for_selector(
+                    DOWNLOAD_BTN_SELECTOR, timeout=15000
+                )
+            except Exception:
+                pass
+
+        if not download_btn:
+            result["errors"].append("未找到下载按钮（赞/下载/收藏工具栏）")
+            return result
+
+        result["title"] = await page.title()
+
+        # 点击下载按钮，捕获弹出的新标签页
+        try:
+            async with context.expect_page(timeout=10000) as new_page_info:
+                await download_btn.click()
+            download_page = await new_page_info.value
+        except Exception:
+            # 可能在同一标签页导航了
+            if "download" in page.url:
+                download_page = page
+            else:
+                result["errors"].append("点击下载按钮后未打开下载页")
+                return result
+
+        # 等待下载页 DOM 就绪
+        try:
+            await download_page.wait_for_load_state(
+                "domcontentloaded", timeout=15000
+            )
+        except Exception:
+            pass
+
+        # 等待下载页内容区渲染（JS 动态生成）
+        content_el = None
+        try:
+            content_el = await download_page.wait_for_selector(
+                DOWNLOAD_PAGE_CONTENT_SELECTOR, timeout=15000
+            )
+        except Exception:
+            await wait_for_challenge(download_page)
+            try:
+                content_el = await download_page.wait_for_selector(
+                    DOWNLOAD_PAGE_CONTENT_SELECTOR, timeout=15000
                 )
             except Exception:
                 pass
 
         if not content_el:
-            # 退而求其次
-            content_el = await page.query_selector("article, .post, main")
-        if not content_el:
-            result["errors"].append("未找到文章内容区域")
+            result["errors"].append("下载页内容未加载")
             return result
 
-        result["title"] = await page.title()
+        # 遍历所有下载源（每个 fieldset 是一个下载通道）
+        fieldsets = await content_el.query_selector_all("fieldset")
+        for fieldset in fieldsets:
+            legend = await fieldset.query_selector("legend")
+            source_name = (await legend.inner_text()).strip() if legend else ""
 
-        # 1. 展开所有 su-spoiler（包括"下载"按钮）
-        spoiler_titles = await page.query_selector_all(".su-spoiler-title")
-        for title_el in spoiler_titles:
-            try:
-                await title_el.click()
-                await asyncio.sleep(0.3)
-            except Exception:
-                pass
+            # 提取密码
+            pwd_input = await fieldset.query_selector(
+                ".inn-download-page__content__item__download-pwd input"
+            )
+            if pwd_input:
+                val = await pwd_input.get_attribute("value")
+                if val and not result["extract_code"]:
+                    result["extract_code"] = val
 
-        # 也尝试点击 <details> 的 summary
-        details_summaries = await page.query_selector_all("details > summary")
-        for summary in details_summaries:
-            try:
-                await summary.click()
-                await asyncio.sleep(0.3)
-            except Exception:
-                pass
+            # 解压密码
+            extract_input = await fieldset.query_selector(
+                ".inn-download-page__content__item__extract-pwd input"
+            )
+            if extract_input:
+                val = await extract_input.get_attribute("value")
+                if val and not result["unzip_password"]:
+                    result["unzip_password"] = val
 
-        # 短暂等待展开动画
-        await asyncio.sleep(0.5)
+            # 下载链接（按钮上的 href）
+            btn_links = await fieldset.query_selector_all(
+                ".inn-download-page__content__btn a[href]"
+            )
+            for a in btn_links:
+                href = await a.get_attribute("href")
+                if href and not href.startswith(("#", "javascript")):
+                    text = (await a.inner_text()).strip() or "下载"
+                    result["download_links"].append({
+                        "url": href,
+                        "text": f"{source_name} - {text}",
+                    })
 
-        # 2. 提取全文本用于密码匹配
-        full_text = await content_el.inner_text()
+            # 下载 URL 输入框
+            url_input = await fieldset.query_selector(
+                ".inn-download-page__content__item__download-url input"
+            )
+            if url_input:
+                val = await url_input.get_attribute("value")
+                if val and val.startswith("http"):
+                    result["download_links"].append({
+                        "url": val,
+                        "text": source_name or "下载 URL",
+                    })
 
-        # 提取码
-        for pattern in [
-            r"提取码[：:\s\-]*([a-zA-Z0-9]{3,8})",
-            r"提取码-([a-zA-Z0-9]{3,8})",
-        ]:
-            m = re.search(pattern, full_text)
-            if m:
-                result["extract_code"] = m.group(1)
-                break
+            # 扫描 QR 码图片（用 context.request 手动获取图片字节）
+            imgs = await fieldset.query_selector_all("img[src]")
+            for img_el in imgs:
+                src = await img_el.get_attribute("src")
+                if not src:
+                    continue
+                try:
+                    resp = await context.request.get(src, timeout=10000)
+                    if not resp.ok:
+                        continue
+                    image_bytes = await resp.body()
+                    if len(image_bytes) > 500_000:
+                        continue
+                    qr_data = scan_qr(image_bytes)
+                    if qr_data:
+                        result["qr_images"].append(src)
+                        result["qr_decoded_urls"].append(qr_data)
+                        result["download_links"].append({
+                            "url": qr_data,
+                            "text": f"二维码解码 - {source_name}",
+                            "qr_source_image": src,
+                        })
+                        print(f"  [QR] {src} -> {qr_data}")
+                except Exception as e:
+                    result["errors"].append(f"图片处理失败 {src}: {e}")
 
-        # 解压/下载密码
-        for pattern in [
-            r"(?:解压)?密码[：:\s\-]*([^\s，,。]{2,30})",
-            r"PASSWORD[：:\s\-]*([^\s，,。]{2,30})",
-        ]:
-            m = re.search(pattern, full_text, re.IGNORECASE)
-            if m:
-                result["unzip_password"] = m.group(1)
-                break
-
-        # 3. 提取所有下载链接
-        links = await content_el.query_selector_all("a[href]")
+        # 也在整个下载页内容区扫描可能遗漏的网盘链接
+        all_links = await content_el.query_selector_all("a[href]")
         download_keywords = [
             "pan.baidu", "baidu.com", "pikpak", "mega.nz", "drive.google",
             "mediafire", "1drv", "onedrive", "terabox", "aliyundrive",
             "123pan", "lanzoui", "lanzou", "weiyun", "yun.cn",
             "magnet:", "mypikpak",
         ]
-        for link in links:
+        existing_urls = {dl["url"] for dl in result["download_links"]}
+        for link in all_links:
             href = await link.get_attribute("href")
-            if not href or href.startswith("#") or href.startswith("javascript"):
+            if (
+                not href
+                or href.startswith(("#", "javascript"))
+                or href in existing_urls
+            ):
                 continue
-            link_text = (await link.inner_text()).strip()
             href_lower = href.lower()
-            text_lower = link_text.lower()
-            if any(kw in href_lower or kw in text_lower for kw in download_keywords):
-                result["download_links"].append({"url": href, "text": link_text})
-
-        # 4. 查找内容区图片，尝试扫描二维码
-        images = await content_el.query_selector_all("img[src]")
-        for img_el in images:
-            src = await img_el.get_attribute("src")
-            if not src:
-                continue
-            # 跳过明显的大预览图
-            try:
-                w = await img_el.get_attribute("width")
-                h = await img_el.get_attribute("height")
-                if w and h and int(w) > 500 and int(h) > 500:
-                    continue
-            except (ValueError, TypeError):
-                pass
-
-            try:
-                resp = await context.request.get(src, timeout=10000)
-                if not resp.ok:
-                    continue
-                image_bytes = await resp.body()
-                if len(image_bytes) > 500_000:
-                    continue
-
-                qr_data = scan_qr(image_bytes)
-                if qr_data:
-                    result["qr_images"].append(src)
-                    result["qr_decoded_urls"].append(qr_data)
-                    result["download_links"].append({
-                        "url": qr_data,
-                        "text": "二维码解码",
-                        "qr_source_image": src,
-                    })
-                    print(f"  [QR] {src} -> {qr_data}")
-            except Exception as e:
-                result["errors"].append(f"图片处理失败 {src}: {e}")
+            if any(kw in href_lower for kw in download_keywords):
+                text = (await link.inner_text()).strip()
+                result["download_links"].append({
+                    "url": href,
+                    "text": text or "下载链接",
+                })
 
     except Exception as e:
         result["errors"].append(str(e))
+    finally:
+        # 关闭下载页标签（如果是新开的标签）
+        if download_page and download_page != page:
+            try:
+                await download_page.close()
+            except Exception:
+                pass
 
     return result
 
@@ -236,6 +285,7 @@ async def main():
             channel="msedge",
             viewport={"width": 1280, "height": 800},
             user_agent=USER_AGENT,
+            args=["--blink-settings=imagesEnabled=false"],
         )
 
         page = context.pages[0] if context.pages else await context.new_page()
