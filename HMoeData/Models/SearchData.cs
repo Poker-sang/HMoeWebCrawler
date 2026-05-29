@@ -4,7 +4,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 
-namespace HMoeWebCrawler.Models;
+namespace HMoeData.Models;
 
 public record SearchData()
 {
@@ -13,9 +13,6 @@ public record SearchData()
         Paged = paged;
     }
 
-    /// <summary>
-    /// Start from 1
-    /// </summary>
     [JsonPropertyName("paged")]
     public int Paged
     {
@@ -42,7 +39,7 @@ public record SearchData()
 
     public string Encode()
     {
-        var u8Str = JsonSerializer.SerializeToUtf8Bytes(this, SerializerContext.DefaultOverride.SearchData);
+        var u8Str = JsonSerializer.SerializeToUtf8Bytes(this, HMoeDataJsonContext.DefaultOverride.SearchData);
         var str = Convert.ToBase64String(u8Str);
         return Uri.EscapeDataString(str);
     }
@@ -52,6 +49,6 @@ public record SearchData()
         while (data.Contains('%'))
             data = Uri.UnescapeDataString(data);
         var u8Str = Encoding.UTF8.GetString(Convert.FromBase64String(data));
-        return JsonSerializer.Deserialize(u8Str, SerializerContext.DefaultOverride.SearchData);
+        return JsonSerializer.Deserialize(u8Str, HMoeDataJsonContext.DefaultOverride.SearchData);
     }
 }

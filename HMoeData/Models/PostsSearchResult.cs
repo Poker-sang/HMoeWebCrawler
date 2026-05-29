@@ -1,7 +1,7 @@
 using System.Collections.Generic;
 using System.Text.Json.Serialization;
 
-namespace HMoeWebCrawler.Models;
+namespace HMoeData.Models;
 
 public record PostsSearchResult
 {

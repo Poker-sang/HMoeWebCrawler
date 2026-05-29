@@ -7,7 +7,8 @@ using System.Net.Http;
 using System.Text.Json;
 using System.Threading;
 using System.Threading.Tasks;
-using HMoeWebCrawler.Models;
+using HMoeData;
+using HMoeData.Models;
 using Microsoft.Playwright;
 using Cookie = System.Net.Cookie;
 
@@ -136,9 +137,9 @@ public class HMoeSession : IAsyncDisposable
         var captchaJson = await PageFetchAsync(
             $"/wp-admin/admin-ajax.php?_nonce={nonce}&action=b9215121b88d889ea28808c5adabbbf5&type=getCaptcha");
 
-        var captchaResponse = JsonSerializer.Deserialize(captchaJson, SerializerContext.Default.ApiResponse)
+        var captchaResponse = JsonSerializer.Deserialize(captchaJson, HMoeDataJsonContext.Default.ApiResponse)
                               ?? throw new InvalidOperationException("Failed to deserialize captcha response.");
-        var captchaData = captchaResponse.GetData(SerializerContext.Default.ImageDataResult);
+        var captchaData = captchaResponse.GetData(HMoeDataJsonContext.Default.ImageDataResult);
         var base64 = captchaData.ImgData;
 
         // 在浏览器中显示验证码
@@ -222,7 +223,7 @@ public class HMoeSession : IAsyncDisposable
         var signJson = await PageFetchAsync(
             $"/wp-admin/admin-ajax.php?_nonce={nonce}&action=9f9fa05823795c1c74e8c27e8d5e6930&type=goSign");
 
-        var response = JsonSerializer.Deserialize(signJson, SerializerContext.Default.ApiResponse)
+        var response = JsonSerializer.Deserialize(signJson, HMoeDataJsonContext.Default.ApiResponse)
                        ?? throw new InvalidOperationException("Failed to deserialize sign response.");
         var status = response.Code is 0;
         Console.WriteLine($"签到{(status ? "成功" : "失败")}: {response.Message}");
@@ -247,12 +248,12 @@ public class HMoeSession : IAsyncDisposable
                     var searchJson = await PageFetchAsync(
                         $"/wp-admin/admin-ajax.php?_nonce={_loginNonce}&action=b9338a11fcc41c1ed5447625d1c0e743&query={query}");
 
-                    var result = JsonSerializer.Deserialize(searchJson, SerializerContext.DefaultOverride.ApiResponse)
+                    var result = JsonSerializer.Deserialize(searchJson, HMoeDataJsonContext.DefaultOverride.ApiResponse)
                                  ?? throw new InvalidOperationException("Failed to deserialize search response.");
 
                     if (result.Code is not 10007)
                     {
-                        var r = result.GetData(SerializerContext.Default.PostsSearchResult);
+                        var r = result.GetData(HMoeDataJsonContext.Default.PostsSearchResult);
                         Console.WriteLine("已下载第 " + data.Paged + " 页");
                         _lastRequest = DateTime.UtcNow;
                         return r.Posts;
