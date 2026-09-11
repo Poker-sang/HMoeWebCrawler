@@ -12,6 +12,9 @@ using HMoeWebCrawler.LocalModels;
 const int continuousExistenceThreshold = 10;
 Settings? settings = null;
 
+ConsoleLogger.Header("HMoe Web Crawler");
+ConsoleLogger.Info("正在加载运行配置...");
+
 // 记录日志路径
 var loggerPath =
 #if DEBUG
@@ -35,11 +38,13 @@ try
 }
 catch (Exception e)
 {
-    WriteException(e);
+    ConsoleLogger.Exception(e, "配置加载失败");
 }
 
 if (settings is null)
     throw new InvalidDataException("Invalid settings " + loggerSettingsPath);
+
+ConsoleLogger.Info($"运行模式: {(settings.NewSession ? "全量会话" : "增量会话")}");
 
 await using var session = new HMoeSession();
 await session.InitAsync();
@@ -69,7 +74,7 @@ while (true)
         if (!postLookup.Exists(post.Id) && postsToSave.All(existingPost => existingPost.Id != post.Id))
         {
             postsToSave.Add(post);
-            Console.WriteLine($"New Item [{post.Id}]: {post.Url}");
+            ConsoleLogger.Success($"New Item [{post.Id}]: {post.Url}");
             newItemsCount++;
             if (continuousExistence < continuousExistenceThreshold)
                 continuousExistence = 0;
@@ -77,7 +82,7 @@ while (true)
         }
         else
         {
-            Console.WriteLine($"Item existed: {post.Id} Continuous existence count: {continuousExistence}");
+            ConsoleLogger.Skip($"Item existed: {post.Id} | Continuous existence count: {continuousExistence} | Next: {continuousExistence + 1}/{continuousExistenceThreshold}");
             continuousExistence++;
         }
 
@@ -87,24 +92,24 @@ while (true)
     data.Paged++;
 }
 
-Console.WriteLine("\e[32m达到连续存在阈值，停止爬取。等待缩略图下载完成\e[0m");
+ConsoleLogger.Success("达到连续存在阈值，停止爬取。等待缩略图下载完成");
 
 await session.WhenAllDownloadAsync();
 
 if (newItemsCount is 0)
 {
-    Console.WriteLine("没有新项目，不保存");
+    ConsoleLogger.Info("没有新项目，不需要保存");
 }
 else
 {
     var resultPosts = postsToSave.OrderByDescending(t => t.Date).ToList();
     var writeTime = DateTimeOffset.UtcNow;
     var currentBatchCount = settings.NewSession ? newItemsCount : latestBatchPostsCount + newItemsCount;
-    Console.WriteLine($"\e[32m本次写入批次 {currentBatchCount} 项，新抓取 {newItemsCount} 项\e[0m");
+    ConsoleLogger.Success($"本次写入批次 {currentBatchCount} 项，新抓取 {newItemsCount} 项");
 
     try
     {
-        Console.WriteLine("Saving " + loggerDbPath);
+        ConsoleLogger.Info("正在保存数据库: " + loggerDbPath);
 
         if (File.Exists(loggerDbPath))
             File.Copy(loggerDbPath, loggerLastDbPath, true);
@@ -113,16 +118,16 @@ else
     }
     catch (Exception e)
     {
-        WriteException(e);
+        ConsoleLogger.Exception(e, "数据库保存失败");
         var fileName = $"TempLog {DateTime.Now:yyyy.MM.dd HH-mm-ss}.db";
-        Console.WriteLine($"\e[31m保存失败，备份到 {fileName}\e[0m");
+        ConsoleLogger.Warning($"主数据库保存失败，正在写入备份: {fileName}");
         var loggerTempDbPath = Path.Combine(loggerPath, fileName);
         HMoeDbStore.SavePosts(loggerTempDbPath, resultPosts, new(writeTime, !settings.NewSession));
+        ConsoleLogger.Success("备份数据库写入完成");
     }
 }
 
+ConsoleLogger.Success("任务完成，按任意键退出");
 Console.ReadKey();
 
 return;
-
-static void WriteException(Exception e) => Console.WriteLine($"\e[90m{e.Message}\e[0m");

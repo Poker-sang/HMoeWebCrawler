@@ -13,7 +13,20 @@ public record SearchData()
         Paged = paged;
     }
 
+    [JsonPropertyName("kw")]
+    [JsonPropertyOrder(0)]
+    public string KeyWord { get; init; } = "";
+
+    [JsonPropertyName("tags")]
+    [JsonPropertyOrder(1)]
+    public string[] Tags { get; init; } = [];
+
+    [JsonPropertyName("cat")]
+    [JsonPropertyOrder(2)]
+    public string[] Cat { get; init; } = [];
+
     [JsonPropertyName("paged")]
+    [JsonPropertyOrder(3)]
     public int Paged
     {
         get;
@@ -25,16 +38,8 @@ public record SearchData()
         }
     }
 
-    [JsonPropertyName("kw")]
-    public string KeyWord { get; init; } = "";
-
-    [JsonPropertyName("tags")]
-    public string[] Tags { get; init; } = [];
-
-    [JsonPropertyName("cat")]
-    public string[] Cat { get; init; } = [];
-
     [JsonPropertyName("cats")]
+    [JsonPropertyOrder(4)]
     public string[] Cats { get; init; } = [];
 
     public string Encode()

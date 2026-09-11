@@ -18,6 +18,12 @@ public class HMoeSession : IAsyncDisposable
 {
     public const string Domain = "https://www.mhh1.com/";
 
+    private const string HomepageAction = "285d6af5ed069e78e04b2d054182dcb5";
+    private const string CaptchaAction = "b9215121b88d889ea28808c5adabbbf5";
+    private const string LoginAction = "0ac2206cd584f32fba03df08b4123264";
+    private const string SignAction = "9f9fa05823795c1c74e8c27e8d5e6930";
+    private const string SuperSearchAction = "b9338a11fcc41c1ed5447625d1c0e743";
+
     /// <summary>
     /// 最大请求间隔，超过后中断
     /// </summary>
@@ -84,7 +90,7 @@ public class HMoeSession : IAsyncDisposable
 
     public async Task NavigateToSiteAsync()
     {
-        Console.WriteLine("正在打开网站...");
+        ConsoleLogger.Info("正在打开网站...");
         var response = await _page!.GotoAsync(Domain, new() { WaitUntil = WaitUntilState.DOMContentLoaded, Timeout = 60000 });
 
         // 等待5秒挑战或其他加载完成
@@ -94,7 +100,7 @@ public class HMoeSession : IAsyncDisposable
         }
         catch (TimeoutException)
         {
-            Console.WriteLine("NetworkIdle 超时，继续...");
+            ConsoleLogger.Warning("等待页面空闲超时，继续处理");
         }
 
         // 如果页面标题包含 challenge 关键字，等待跳转完成
@@ -102,7 +108,7 @@ public class HMoeSession : IAsyncDisposable
         if (title.Contains("moment", StringComparison.OrdinalIgnoreCase)
             || title.Contains("check", StringComparison.OrdinalIgnoreCase))
         {
-            Console.WriteLine("检测到挑战页面，等待自动跳转...");
+            ConsoleLogger.Info("检测到验证页面，等待自动跳转...");
             try
             {
                 await _page.WaitForURLAsync($"{Domain}**", new() { Timeout = 30000 });
@@ -110,32 +116,33 @@ public class HMoeSession : IAsyncDisposable
             }
             catch (TimeoutException)
             {
-                Console.WriteLine("挑战页面等待超时，继续...");
+                ConsoleLogger.Warning("验证页面等待超时，继续处理");
             }
         }
 
-        Console.WriteLine($"\e[32m网站已打开: {_page.Url}\e[0m");
+        ConsoleLogger.Success("网站已打开: " + _page.Url);
         await SyncCookiesToHttpClientAsync();
     }
 
     public async Task EnsureLoggedInAsync(string email, string password)
     {
-        var cookies = await _browserContext!.CookiesAsync([Domain]);
-        var isLoggedIn = cookies.Any(c => c.Name.StartsWith("wordpress_logged_in"));
+        // The login cookie can remain in the profile after it has expired. The
+        // homepage nonce response reflects the server-side session state.
+        var (nonce, isLoggedIn) = await FetchNonceInfoFromPageAsync();
 
         if (isLoggedIn)
         {
-            Console.WriteLine("\e[32m已登录\e[0m");
+            ConsoleLogger.Success("当前会话已登录");
             return;
         }
 
-        Console.WriteLine("未登录，正在登录...");
-
-        var nonce = await FetchNonceFromPageAsync();
+        ConsoleLogger.Info("当前会话未登录，开始登录...");
 
         // 获取验证码
         var captchaJson = await PageFetchAsync(
-            $"/wp-admin/admin-ajax.php?_nonce={nonce}&action=b9215121b88d889ea28808c5adabbbf5&type=getCaptcha");
+            $"/wp-admin/admin-ajax.php?_nonce={nonce}&action={CaptchaAction}&type=getCaptcha");
+
+        ConsoleLogger.Info("验证码已获取，请在浏览器窗口中查看");
 
         var captchaResponse = JsonSerializer.Deserialize(captchaJson, HMoeDataJsonContext.Default.ApiResponse)
                               ?? throw new InvalidOperationException("Failed to deserialize captcha response.");
@@ -164,7 +171,7 @@ public class HMoeSession : IAsyncDisposable
         string? captcha;
         do
         {
-            Console.Write("请输入验证码: ");
+            ConsoleLogger.Prompt("请输入验证码: ");
             captcha = Console.ReadLine();
         } while (string.IsNullOrWhiteSpace(captcha));
 
@@ -173,8 +180,8 @@ public class HMoeSession : IAsyncDisposable
         // 提交登录（使用参数化调用防止注入）
         var loginJson = await _page.EvaluateAsync<string>(
             """
-            async ([nonce, email, pwd, captcha]) => {
-                const url = `/wp-admin/admin-ajax.php?_nonce=${nonce}&action=0ac2206cd584f32fba03df08b4123264&type=login`;
+            async ([nonce, email, pwd, captcha, loginAction]) => {
+                const url = `/wp-admin/admin-ajax.php?_nonce=${nonce}&action=${loginAction}&type=login`;
                 const formData = new URLSearchParams();
                 formData.append('email', email);
                 formData.append('pwd', pwd);
@@ -187,13 +194,34 @@ public class HMoeSession : IAsyncDisposable
                 });
                 return await response.text();
             }
-            """, new object[] { nonce, email, password, captcha });
+            """, new object[] { nonce, email, password, captcha, LoginAction });
 
-        Console.WriteLine("登录响应: " + loginJson);
+        ConsoleLogger.Info("登录响应: " + loginJson);
+
+        using (var loginDocument = JsonDocument.Parse(loginJson))
+        {
+            var root = loginDocument.RootElement;
+            if (root.TryGetProperty("code", out var code)
+                && code.ValueKind is JsonValueKind.Number
+                && code.GetInt32() is not 0)
+            {
+                var message = root.TryGetProperty("msg", out var msg)
+                    ? msg.GetString()
+                    : "未知错误";
+                throw new InvalidOperationException($"登录失败 ({code.GetInt32()}): {message}");
+            }
+        }
+
+        ConsoleLogger.Info("登录请求已接受，正在确认会话状态...");
 
         await _page.ReloadAsync(new() { WaitUntil = WaitUntilState.NetworkIdle });
         await SyncCookiesToHttpClientAsync();
-        Console.WriteLine("\e[32m登录完成\e[0m");
+
+        var loggedInInfo = await FetchNonceInfoFromPageAsync();
+        if (!loggedInInfo.IsLoggedIn)
+            throw new InvalidOperationException("登录响应成功，但服务器仍未识别为已登录。");
+
+        ConsoleLogger.Success("登录完成");
     }
 
     public async Task<string> FetchNonceAsync()
@@ -206,27 +234,52 @@ public class HMoeSession : IAsyncDisposable
 
     private async Task<string> FetchNonceFromPageAsync()
     {
-        Console.WriteLine("正在获取 nonce...");
+        return (await FetchNonceInfoFromPageAsync()).Nonce;
+    }
+
+    private async Task<(string Nonce, bool IsLoggedIn)> FetchNonceInfoFromPageAsync()
+    {
+        ConsoleLogger.Info("正在获取会话凭据...");
         var nonceJson = await PageFetchAsync(
-            "/wp-admin/admin-ajax.php?action=285d6af5ed069e78e04b2d054182dcb5&d6ca819426678dab7a26ecb2802d8aec%5Btype%5D=checkUnread&6f05c9bced69c22452fcd115e6fc4838%5Btype%5D=getHomepagePosts");
+            $"/wp-admin/admin-ajax.php?action={HomepageAction}&d6ca819426678dab7a26ecb2802d8aec%5Btype%5D=checkUnread&6f05c9bced69c22452fcd115e6fc4838%5Btype%5D=getHomepagePosts");
 
         using var jsonDocument = JsonDocument.Parse(nonceJson);
-        var nonce = jsonDocument.RootElement.GetProperty("_nonce").GetString()
+        var root = jsonDocument.RootElement;
+        var nonce = root.GetProperty("_nonce").GetString()
                     ?? throw new InvalidOperationException("Nonce not found in response.");
-        Console.WriteLine("获取 nonce: " + nonce);
-        return nonce;
+
+        var isLoggedIn = root.TryGetProperty("user", out var user)
+                         && user.ValueKind is JsonValueKind.Object
+                         && user.TryGetProperty("id", out var userId)
+                         && IsAuthenticatedUserId(userId);
+
+        ConsoleLogger.Success("获取 nonce: " + nonce);
+        return (nonce, isLoggedIn);
+    }
+
+    private static bool IsAuthenticatedUserId(JsonElement userId)
+    {
+        if (userId.ValueKind == JsonValueKind.Number)
+            return userId.TryGetInt64(out var numericId) && numericId is not 0;
+
+        return userId.ValueKind == JsonValueKind.String
+               && long.TryParse(userId.GetString(), out var stringId)
+               && stringId is not 0;
     }
 
     public async Task<bool> SignAsync(string nonce)
     {
-        Console.WriteLine("正在签到...");
+        ConsoleLogger.Info("正在签到...");
         var signJson = await PageFetchAsync(
-            $"/wp-admin/admin-ajax.php?_nonce={nonce}&action=9f9fa05823795c1c74e8c27e8d5e6930&type=goSign");
+            $"/wp-admin/admin-ajax.php?_nonce={nonce}&action={SignAction}&type=goSign");
 
         var response = JsonSerializer.Deserialize(signJson, HMoeDataJsonContext.Default.ApiResponse)
                        ?? throw new InvalidOperationException("Failed to deserialize sign response.");
         var status = response.Code is 0;
-        Console.WriteLine($"签到{(status ? "成功" : "失败")}: {response.Message}");
+        if (status)
+            ConsoleLogger.Success("签到成功: " + response.Message);
+        else
+            ConsoleLogger.Warning("签到失败: " + response.Message);
         return status;
     }
 
@@ -243,10 +296,10 @@ public class HMoeSession : IAsyncDisposable
                         await Task.Delay(500);
 
                     var query = data.Encode();
-                    Console.WriteLine("正在下载第 " + data.Paged + " 页");
+                    ConsoleLogger.Info("正在下载第 " + data.Paged + " 页...");
 
                     var searchJson = await PageFetchAsync(
-                        $"/wp-admin/admin-ajax.php?_nonce={_loginNonce}&action=b9338a11fcc41c1ed5447625d1c0e743&query={query}");
+                        $"/wp-admin/admin-ajax.php?_nonce={_loginNonce}&action={SuperSearchAction}&query={query}");
 
                     var result = JsonSerializer.Deserialize(searchJson, HMoeDataJsonContext.DefaultOverride.ApiResponse)
                                  ?? throw new InvalidOperationException("Failed to deserialize search response.");
@@ -254,22 +307,23 @@ public class HMoeSession : IAsyncDisposable
                     if (result.Code is not 10007)
                     {
                         var r = result.GetData(HMoeDataJsonContext.Default.PostsSearchResult);
-                        Console.WriteLine("已下载第 " + data.Paged + " 页");
+                        ConsoleLogger.Success($"第 {data.Paged} 页完成，共 {r.Posts.Count} 条");
                         _lastRequest = DateTime.UtcNow;
                         return r.Posts;
                     }
                 }
 
                 // 会话过期，刷新页面重新获取凭据
-                Console.WriteLine("会话过期，正在刷新...");
+                ConsoleLogger.Warning("会话已过期，正在刷新凭据...");
                 await _page!.ReloadAsync(new() { WaitUntil = WaitUntilState.NetworkIdle });
                 _loginNonce = await FetchNonceFromPageAsync();
             }
             catch (Exception e)
             {
-                WriteException(e);
+                ConsoleLogger.Exception(e);
                 if (coolDown > CoolDownThreshold)
                     throw;
+                ConsoleLogger.Warning($"搜索请求失败: {e.Message}，{coolDown.TotalSeconds:0} 秒后重试");
                 coolDown *= 2;
                 await Task.Delay(coolDown);
             }
@@ -319,23 +373,23 @@ public class HMoeSession : IAsyncDisposable
             // 优先使用 HttpClient 直接下载（更快更稳定）
             if (await TryDownloadWithHttpClientAsync(postThumbnailUrl, imgPath))
             {
-                Console.WriteLine("Downloaded thumbnail " + fileName);
+                ConsoleLogger.Success($"缩略图完成  #{post.Id}  {fileName}");
                 return;
             }
 
             // 回退到浏览器内 fetch 下载，自动带上完整的浏览器环境
             if (await TryDownloadWithBrowserAsync(postThumbnailUrl, imgPath))
             {
-                Console.WriteLine("Downloaded thumbnail (browser fallback) " + fileName);
+                ConsoleLogger.Success($"缩略图完成  #{post.Id}  {fileName}  [浏览器回退]");
                 return;
             }
 
-            Console.WriteLine($"Download thumbnail failed [{post.Id}]: {postThumbnailUrl}");
+            ConsoleLogger.Error($"Download thumbnail failed [{post.Id}]: {postThumbnailUrl}");
         }
         catch (Exception e)
         {
-            WriteException(e);
-            Console.WriteLine($"Download thumbnail failed [{post.Id}]: {postThumbnailUrl} ({post.Url})");
+            ConsoleLogger.Exception(e);
+            ConsoleLogger.Error($"Download thumbnail failed [{post.Id}]: {postThumbnailUrl} ({post.Url})");
             if (File.Exists(imgPath))
                 File.Delete(imgPath);
         }
@@ -401,8 +455,6 @@ public class HMoeSession : IAsyncDisposable
             return false;
         }
     }
-
-    private static void WriteException(Exception e) => Console.WriteLine($"\e[90m{e.Message}\e[0m");
 
     private async Task SyncCookiesToHttpClientAsync()
     {
